@@ -41,6 +41,8 @@ from sensors.bp_sensor   import InvasiveBPSensor
 
 SENSOR        = "ecg"    # "ecg" | "spo2" | "bp"
 HEART_RATE    = 72       # BPM  (applies to all sensors)
+NOISE_LEVEL   = "low"    # off|low|medium|high (all sensors). low: filters recover
+                         # the target; medium/high intentionally stress naive detection.
 SPO2_TARGET   = 98.0     # %%   (SpO2 sensor only)
 SYS_MMHG      = 120.0    # mmHg (BP sensor only)
 DIA_MMHG      = 80.0     # mmHg (BP sensor only)
@@ -288,13 +290,15 @@ def start_sensor(sensor_name: str):
     write_end, read_end = MockSerialPair.create(sensor_name.upper())
 
     if sensor_name == "ecg":
-        sensor = ECGSensor(heart_rate_bpm=HEART_RATE, serial_override=write_end)
+        sensor = ECGSensor(heart_rate_bpm=HEART_RATE, noise_level=NOISE_LEVEL,
+                           serial_override=write_end)
     elif sensor_name == "spo2":
         sensor = SpO2Sensor(spo2_pct=SPO2_TARGET, heart_rate_bpm=HEART_RATE,
-                            serial_override=write_end)
+                            noise_level=NOISE_LEVEL, serial_override=write_end)
     elif sensor_name == "bp":
         sensor = InvasiveBPSensor(systolic_mmhg=SYS_MMHG, diastolic_mmhg=DIA_MMHG,
-                                  heart_rate_bpm=HEART_RATE, serial_override=write_end)
+                                  heart_rate_bpm=HEART_RATE, noise_level=NOISE_LEVEL,
+                                  serial_override=write_end)
     else:
         raise ValueError(f"Unknown sensor: {sensor_name!r}")
 
@@ -366,7 +370,11 @@ def run_live_plot(receiver: DataReceiver, proto: dict):
     window_samples = sample_rate * PLOT_WINDOW_S
 
     if SENSOR == "ecg":
-        b_bp, a_bp = build_bandpass_filter(sample_rate, 0.5, 40.0)
+        # Passband widened to 70 Hz (was 40). At a 40 Hz cutoff the band-pass
+        # already suppresses 60 Hz, so the notch is redundant; at 70 Hz the mains
+        # sits IN-band and the 60 Hz notch does real work. Set NOISE_LEVEL and
+        # toggle the notch below to see it. (Sensor bandwidth is 0.05-150 Hz.)
+        b_bp, a_bp = build_bandpass_filter(sample_rate, 0.5, 70.0)
         b_n,  a_n  = build_notch_filter(sample_rate, 60.0)
     elif SENSOR == "spo2":
         # SpO2: skip the bandpass here — we remove DC via a rolling mean in the

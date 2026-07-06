@@ -13,7 +13,7 @@ The PPG waveform has two components:
   - DC component: slow-moving baseline (~1.0 V in real hardware, normalized here)
   - AC component: pulsatile signal riding on top of DC (~1-10 mV amplitude)
 
-Packet format (11 bytes per sample):
+Packet format (12 bytes per sample):
   [0xCC] [0xDD]                          2 bytes  - preamble / sync
   [timestamp_ms: uint32, big-endian]     4 bytes  - ms since stream start
   [ppg_red: int16, big-endian]           2 bytes  - red channel (660 nm), scaled uV
@@ -63,24 +63,45 @@ class SpO2Sensor:
     _CAL_A = 110.0
     _CAL_B = 25.0
 
+    # Noise presets. Motion is the dominant real-world SpO2 error source, so it
+    # scales aggressively here.
+    #   noise  : fraction of AC amplitude -> per-channel broadband noise
+    #   motion : fraction of AC amplitude -> per-channel motion swing (0.3 Hz,
+    #            independent phase per channel, so it biases the R-ratio)
+    #   wander : fraction of DC level -> shared slow baseline drift (0.1 Hz)
+    # "low" keeps the recovered SpO2 close to target; "medium"/"high"
+    # intentionally corrupt the R-ratio the way real motion artifact does.
+    NOISE_PRESETS = {
+        "off":    dict(noise=0.000, motion=0.00, wander=0.000),
+        "low":    dict(noise=0.005, motion=0.02, wander=0.010),
+        "medium": dict(noise=0.020, motion=0.08, wander=0.040),
+        "high":   dict(noise=0.050, motion=0.20, wander=0.100),
+    }
+
     def __init__(self, port: str = None, spo2_pct: float = 98.0,
-                 heart_rate_bpm: int = 72, noise_scale: float = 0.005,
+                 heart_rate_bpm: int = 72, noise_level: str = "low",
                  baud_rate: int = BAUD_RATE, serial_override=None):
         """
         Args:
             port             : Serial port string. Ignored when serial_override is set.
             spo2_pct         : Target SpO2 percentage (94.0 - 100.0)
             heart_rate_bpm   : Underlying pulse rate for PPG morphology
-            noise_scale      : Fractional noise on PPG amplitude
+            noise_level      : "off" | "low" | "medium" | "high"
             baud_rate        : Serial baud rate
             serial_override  : MockSerial or pyserial Serial object.
         """
         self.port             = port or "MOCK"
         self.spo2_pct         = max(80.0, min(100.0, spo2_pct))
         self.heart_rate_bpm   = heart_rate_bpm
-        self.noise_scale      = noise_scale
         self.baud_rate        = baud_rate
         self._serial_override = serial_override
+
+        if noise_level not in self.NOISE_PRESETS:
+            raise ValueError(f"noise_level must be one of "
+                             f"{list(self.NOISE_PRESETS)}, got {noise_level!r}")
+        self.noise_level = noise_level
+        self._noise      = dict(self.NOISE_PRESETS[noise_level])
+        self._rng        = random.Random()   # dedicated; never touches global state
 
         self._serial          = None
         self._running         = False
@@ -129,21 +150,30 @@ class SpO2Sensor:
                         motion_phase_offset: float = 0.0) -> float:
         """
         Return one channel sample in normalized units (will be scaled to int16).
-          total = DC + AC_component * amplitude + noise + motion
+          total = DC + AC_component*amplitude + noise + motion + wander
 
-        motion_phase_offset gives each channel an independent motion phase so
-        the artifact does not coherently bias the R-ratio estimate.
+        motion_phase_offset gives each channel an independent motion phase, so
+        (unlike ideal conditions) the artifact does NOT cancel in the R-ratio --
+        which is exactly why real motion corrupts SpO2 readings.
         """
         phase = self._pulse_phase(t_s)
         ac    = self._ppg_ac_component(phase) * ac_amplitude
-        noise = random.gauss(0, ac_amplitude * self.noise_scale)
-        # Slow motion artifact (0.3 Hz) — small amplitude, independent phase per channel
-        motion = ac_amplitude * 0.008 * math.sin(2 * math.pi * 0.3 * t_s + motion_phase_offset)
-        # Subtract AC: during systole more blood absorbs more light → lower intensity.
-        # This gives the familiar upward-peak PPG shape when plotted (dc - ac peaks upward
-        # because ac is maximum when the vessel is most full).
-        # Note: we negate so the pulsatile peak appears as a positive deflection on screen.
-        return dc_level - ac + noise + motion
+        p     = self._noise
+
+        noise = motion = wander = 0.0
+        if p["noise"] > 0.0:
+            noise = self._rng.gauss(0.0, ac_amplitude * p["noise"])
+        if p["motion"] > 0.0:
+            # 0.3 Hz swing, per-channel phase -> differential R-ratio corruption
+            motion = ac_amplitude * p["motion"] * math.sin(
+                2 * math.pi * 0.3 * t_s + motion_phase_offset)
+        if p["wander"] > 0.0:
+            # Shared slow DC drift (0.1 Hz), same for both channels
+            wander = dc_level * p["wander"] * math.sin(2 * math.pi * 0.10 * t_s)
+
+        # Subtract AC: during systole more blood absorbs more light -> lower
+        # intensity. Negating makes the pulsatile peak a positive deflection.
+        return dc_level - ac + noise + motion + wander
 
     def _compute_channels(self, t_s: float):
         """
@@ -180,7 +210,7 @@ class SpO2Sensor:
           0xCC 0xDD | uint32 ts | int16 red | int16 ir | uint8 spo2 | 0xFE
         """
         # Add small physiological variation (+/- 1%) to reported SpO2
-        reported_spo2 = int(self.spo2_pct + random.gauss(0, 0.3))
+        reported_spo2 = int(self.spo2_pct + self._rng.gauss(0, 0.3))
         reported_spo2 = max(0, min(100, reported_spo2))
 
         payload = struct.pack(self.PACKET_FORMAT,
@@ -213,7 +243,8 @@ class SpO2Sensor:
         print(f"[SpO2] Connected on {self.port} @ {self.baud_rate} baud")
         print(f"[SpO2] SpO2 target: {self.spo2_pct:.1f}% | "
               f"Heart rate: {self.heart_rate_bpm} BPM | "
-              f"Sample rate: {self.SAMPLE_RATE_HZ} Hz")
+              f"Sample rate: {self.SAMPLE_RATE_HZ} Hz | "
+              f"Noise level: {self.noise_level}")
 
     def disconnect(self):
         self._running = False
@@ -269,14 +300,16 @@ def main():
     parser.add_argument("--baud",  default=115200, type=int)
     parser.add_argument("--spo2",  default=98.0,  type=float, help="SpO2 %% (default: 98.0)")
     parser.add_argument("--hr",    default=72,    type=int,   help="Heart rate BPM (default: 72)")
-    parser.add_argument("--noise", default=0.005, type=float, help="Noise scale (default: 0.005)")
+    parser.add_argument("--level", default="low",
+                        choices=list(SpO2Sensor.NOISE_PRESETS),
+                        help="Noise level (default: low)")
     args = parser.parse_args()
 
     sensor = SpO2Sensor(
         port           = args.port,
         spo2_pct       = args.spo2,
         heart_rate_bpm = args.hr,
-        noise_scale    = args.noise,
+        noise_level    = args.level,
         baud_rate      = args.baud,
     )
     sensor.connect()

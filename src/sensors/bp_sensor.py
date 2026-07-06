@@ -61,11 +61,26 @@ class InvasiveBPSensor:
     FOOTER         = b'\xEE'
     PACKET_FORMAT  = '>I h BB'  # uint32 ts, int16 pressure*10, uint8 sys, uint8 dia
 
+    # Noise presets (mmHg). Respiratory sway (~3 mmHg) and beat-to-beat
+    # variability are always-on physiology; these scale the *artifacts*:
+    #   hf_mmhg    : high-frequency transducer/electrical noise (std dev)
+    #   mains_mmhg : 60 Hz power-line interference (the notch's target)
+    #   motion_mmhg: peak of intermittent line-flush / motion excursions
+    # At 200 Hz the 60 Hz mains is in-band, so the notch-only BP filter path
+    # finally has something to remove. Percentile sys/dia stays correct at
+    # "low"; "medium"/"high" progressively stress naive detection.
+    NOISE_PRESETS = {
+        "off":    dict(hf_mmhg=0.0, mains_mmhg=0.0, motion_mmhg=0.0),
+        "low":    dict(hf_mmhg=0.8, mains_mmhg=1.5, motion_mmhg=2.0),
+        "medium": dict(hf_mmhg=1.5, mains_mmhg=3.0, motion_mmhg=6.0),
+        "high":   dict(hf_mmhg=3.0, mains_mmhg=6.0, motion_mmhg=15.0),
+    }
+
     def __init__(self, port: str = None,
                  systolic_mmhg: float  = 120.0,
                  diastolic_mmhg: float = 80.0,
                  heart_rate_bpm: int   = 72,
-                 noise_mmhg: float     = 1.5,
+                 noise_level: str      = "low",
                  baud_rate: int        = BAUD_RATE,
                  serial_override       = None):
         """
@@ -74,7 +89,7 @@ class InvasiveBPSensor:
             systolic_mmhg    : Peak systolic pressure in mmHg
             diastolic_mmhg   : Diastolic (baseline) pressure in mmHg
             heart_rate_bpm   : Heart rate controlling cycle duration
-            noise_mmhg       : Std dev of additive pressure noise (mmHg)
+            noise_level      : "off" | "low" | "medium" | "high"
             baud_rate        : Serial baud rate
             serial_override  : MockSerial or pyserial Serial object.
         """
@@ -82,9 +97,30 @@ class InvasiveBPSensor:
         self.systolic_mmhg    = systolic_mmhg
         self.diastolic_mmhg   = diastolic_mmhg
         self.heart_rate_bpm   = heart_rate_bpm
-        self.noise_mmhg       = noise_mmhg
         self.baud_rate        = baud_rate
         self._serial_override = serial_override
+
+        if noise_level not in self.NOISE_PRESETS:
+            raise ValueError(f"noise_level must be one of "
+                             f"{list(self.NOISE_PRESETS)}, got {noise_level!r}")
+        self.noise_level = noise_level
+        self._noise      = dict(self.NOISE_PRESETS[noise_level])
+
+        # Dedicated RNG for high-frequency/motion noise so we never touch the
+        # global random module state (the old code reseeded it every sample).
+        self._rng          = random.Random()
+        self._mains_phase  = self._rng.uniform(0, 2 * math.pi)
+
+        # Cached per-beat variability (constant within a beat, reproducible)
+        self._beat_index   = -1
+        self._beat_offset  = 0.0
+
+        # Motion-artifact burst state
+        self._motion_remaining = 0
+        self._motion_len       = 1
+        self._motion_amp       = 0.0
+        self._motion_freq      = 1.0
+        self._motion_prob      = 1.0 / (4.0 * self.SAMPLE_RATE_HZ)  # ~1 per 4 s
 
         self._serial          = None
         self._running         = False
@@ -142,7 +178,8 @@ class InvasiveBPSensor:
     def _pressure_sample(self, t_s: float) -> float:
         """
         Return absolute arterial pressure in mmHg at time t_s.
-        Includes respiratory variation and noise.
+        Includes respiratory variation, beat-to-beat variability, and the
+        noise-level artifacts (see add_realistic_noise).
         """
         cycle_s = self._cardiac_cycle_s()
         phase   = (t_s % cycle_s) / cycle_s
@@ -151,19 +188,64 @@ class InvasiveBPSensor:
         norm_wave = self._arterial_waveform(phase)
         pressure  = self.diastolic_mmhg + norm_wave * self._pulse_pressure
 
-        # Respiratory variation (~0.25 Hz, ±3 mmHg — normal physiological range)
+        # Respiratory variation (~0.25 Hz, +-3 mmHg) — always-on physiology
         pressure += 3.0 * math.sin(2 * math.pi * 0.25 * t_s)
 
-        # Beat-to-beat variation (±2 mmHg systolic variability)
+        # Beat-to-beat variability: constant within a beat, reproducible per
+        # beat, and WITHOUT disturbing the global random state.
         beat_index = int(t_s / cycle_s)
-        random.seed(beat_index)             # same noise per beat
-        pressure  += random.gauss(0, 1.2)
-        random.seed()                       # restore random state
+        if beat_index != self._beat_index:
+            self._beat_index  = beat_index
+            self._beat_offset = random.Random(beat_index).gauss(0, 1.2)
+        pressure += self._beat_offset
 
-        # High-frequency noise
-        pressure += random.gauss(0, self.noise_mmhg)
+        # Noise-level artifacts (hf noise + 60 Hz mains + motion bursts)
+        pressure += self.add_realistic_noise(t_s)
 
         return pressure
+
+    # ------------------------------------------------------------------
+    # Noise / artifact model
+    # ------------------------------------------------------------------
+
+    def add_realistic_noise(self, t_s: float) -> float:
+        """
+        Total artifact (mmHg) at time t_s per the active NOISE_PRESETS entry:
+          hf     - broadband transducer/electrical noise
+          mains  - 60 Hz power-line interference (in-band at 200 Hz -> the
+                   notch-only BP filter path removes it)
+          motion - intermittent low-frequency excursions (line flush, patient
+                   movement) that a notch cannot remove
+        """
+        p = self._noise
+        n = 0.0
+        if p["hf_mmhg"] > 0.0:
+            n += self._rng.gauss(0.0, p["hf_mmhg"])
+        if p["mains_mmhg"] > 0.0:
+            n += p["mains_mmhg"] * math.sin(2 * math.pi * 60.0 * t_s + self._mains_phase)
+        if p["motion_mmhg"] > 0.0:
+            n += self._motion_artifact(t_s, p["motion_mmhg"])
+        return n
+
+    def _motion_artifact(self, t_s: float, peak_mmhg: float) -> float:
+        """
+        Occasional motion/flush excursion: a slow (0.5-3 Hz) swing under a
+        smooth Hann envelope, lasting ~0.3-1.0 s. Low-frequency and large, so
+        it survives the notch and can distort naive percentile detection.
+        """
+        if self._motion_remaining <= 0:
+            if self._rng.random() >= self._motion_prob:
+                return 0.0
+            self._motion_len       = self._rng.randint(int(0.30 * self.SAMPLE_RATE_HZ),
+                                                        int(1.00 * self.SAMPLE_RATE_HZ))
+            self._motion_remaining = self._motion_len
+            self._motion_amp       = peak_mmhg * self._rng.uniform(0.5, 1.0)
+            self._motion_freq      = self._rng.uniform(0.5, 3.0)
+
+        pos = 1.0 - (self._motion_remaining / self._motion_len)
+        env = 0.5 * (1.0 - math.cos(2.0 * math.pi * pos))
+        self._motion_remaining -= 1
+        return self._motion_amp * env * math.sin(2.0 * math.pi * self._motion_freq * t_s)
 
     # ------------------------------------------------------------------
     # Packet framing
@@ -210,7 +292,8 @@ class InvasiveBPSensor:
         print(f"[IBP]  Connected on {self.port} @ {self.baud_rate} baud")
         print(f"[IBP]  BP target: {self.systolic_mmhg:.0f}/{self.diastolic_mmhg:.0f} mmHg | "
               f"HR: {self.heart_rate_bpm} BPM | "
-              f"Sample rate: {self.SAMPLE_RATE_HZ} Hz")
+              f"Sample rate: {self.SAMPLE_RATE_HZ} Hz | "
+              f"Noise level: {self.noise_level}")
 
     def disconnect(self):
         self._running = False
@@ -267,7 +350,9 @@ def main():
     parser.add_argument("--sys",   default=120.0, type=float, help="Systolic mmHg (default: 120)")
     parser.add_argument("--dia",   default=80.0,  type=float, help="Diastolic mmHg (default: 80)")
     parser.add_argument("--hr",    default=72,    type=int,   help="Heart rate BPM (default: 72)")
-    parser.add_argument("--noise", default=1.5,   type=float, help="Noise std dev mmHg (default: 1.5)")
+    parser.add_argument("--level", default="low",
+                        choices=list(InvasiveBPSensor.NOISE_PRESETS),
+                        help="Noise level (default: low)")
     args = parser.parse_args()
 
     sensor = InvasiveBPSensor(
@@ -275,7 +360,7 @@ def main():
         systolic_mmhg   = args.sys,
         diastolic_mmhg  = args.dia,
         heart_rate_bpm  = args.hr,
-        noise_mmhg      = args.noise,
+        noise_level     = args.level,
         baud_rate       = args.baud,
     )
     sensor.connect()
